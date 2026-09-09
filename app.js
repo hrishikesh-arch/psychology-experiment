@@ -152,8 +152,15 @@ function renderFrame(content, wide = false) {
   document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
       clearTimers();
-      if (button.dataset.view === "admin") renderAdminLogin();
-      else renderOnboarding();
+      if (button.dataset.view === "admin") {
+        if (sessionStorage.getItem("study_admin") === "true") {
+          renderAdminDashboard();
+        } else {
+          renderAdminLogin();
+        }
+      } else {
+        renderOnboarding();
+      }
     });
   });
 }
@@ -767,23 +774,20 @@ function renderAdminLogin(error = "") {
   renderFrame(`
     <form class="entry-card admin-login" id="adminForm">
       <h2>Administrator Access</h2>
-      <label><span>Name</span><input id="adminName" required></label>
-      <label><span>Phone</span><input id="adminPhone" required></label>
-      <label><span>Secret passcode</span><input id="adminPasscode" type="password" required></label>
+      <p style="color:var(--gray-600);margin-bottom:1rem;font-size:0.95rem;">Enter the administrative passcode to access study metrics and session logs.</p>
+      <label><span>Secret passcode</span><input id="adminPasscode" type="password" placeholder="Enter passcode" autofocus required></label>
       ${error ? `<p class="error">${escapeHtml(error)}</p>` : ""}
       <button class="primary-btn" type="submit">Unlock Dashboard</button>
     </form>
   `);
   document.getElementById("adminForm").addEventListener("submit", (event) => {
     event.preventDefault();
-    const name = document.getElementById("adminName").value.trim();
-    const phone = document.getElementById("adminPhone").value.trim();
-    const passcode = document.getElementById("adminPasscode").value;
-    if (!name || !phone || passcode !== ADMIN_PASSCODE) {
-      renderAdminLogin("Admin details are incomplete or the passcode is wrong.");
+    const passcode = document.getElementById("adminPasscode").value.trim();
+    if (passcode.toUpperCase() !== ADMIN_PASSCODE.toUpperCase()) {
+      renderAdminLogin("Incorrect passcode. Please enter ADMIN2026.");
       return;
     }
-    sessionStorage.setItem("study_admin", JSON.stringify({ name, phone }));
+    sessionStorage.setItem("study_admin", "true");
     renderAdminDashboard();
   });
 }
@@ -1101,4 +1105,17 @@ function escapeHtml(text) {
     .replace(/'/g, "&#039;");
 }
 
-renderOnboarding();
+function checkInitialRoute() {
+  if (window.location.hash === "#admin" || window.location.search.includes("admin")) {
+    if (sessionStorage.getItem("study_admin") === "true") {
+      renderAdminDashboard();
+    } else {
+      renderAdminLogin();
+    }
+  } else {
+    renderOnboarding();
+  }
+}
+
+window.addEventListener("hashchange", checkInitialRoute);
+checkInitialRoute();
