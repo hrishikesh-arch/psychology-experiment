@@ -2,7 +2,9 @@ const STORAGE_KEY = "digital_bystander_experiment_v2";
 const ADMIN_PASSCODE = "ADMIN2026";
 const HELP_OFFSET_MS = 45000;
 const TIMEOUT_MS = 180000;
-const HELP_CUE = "Sorry, I missed that part of the instructions — how long did they say we have for this session?";
+const HELP_CUE_1 = "Who is conducting";
+const HELP_CUE_2 = "What is the duration of the meeting";
+const HELP_CUE_3 = "what is the meeting joining Code";
 
 const app = document.getElementById("app");
 
@@ -306,8 +308,13 @@ function startSession(participant, group) {
     entryTime: new Date().toISOString(),
     helpCueShownAt: null,
     completedAt: null,
-    responded: null,
-    latencySeconds: null,
+    
+    // New 3-step state
+    cueState: 0,
+    latencies: [null, null, null],
+    responded: [null, null, null],
+    
+    latencySeconds: null, // We keep this for backward compatibility or avg
     timeoutDeadline: null,
     messages: messages,
     scriptIndex: 0
@@ -414,19 +421,23 @@ function scheduleMessages(sessionId) {
   const baseScript = botScripts[session.scriptIndex] || botScripts[0];
   const allScript = [
     ...baseScript.map((line, index) => ({ line, key: `pre_${index}` })),
-    { line: [HELP_OFFSET_MS, "Samir", HELP_CUE, "help"], key: "help_cue" },
     ...postHelpScript.map((line, index) => ({ line, key: `post_${index}` }))
   ];
 
   allScript.forEach(({ line, key }) => {
     if (alreadyShown.has(key)) return;
     const [delay, sender, rawText, kind] = line;
+    
+    // trigger cue 1 after the last pre script finishes
+    if (key === "pre_" + (baseScript.length - 1)) {
+      timers.push(setTimeout(() => triggerCue(sessionId, 1), delay + 4000));
+    }
+    
     timers.push(setTimeout(() => {
       const latest = loadState().sessions.find((item) => item.id === sessionId);
       if (!latest || latest.status === "COMPLETED") return;
       const text = rawText.replaceAll("{{name}}", latest.participantName);
       addMessage(sessionId, { sender, text, kind: kind || "bot", scriptKey: key });
-      if (key === "help_cue") markHelpCueShown(sessionId);
     }, delay));
   });
 }
@@ -468,34 +479,56 @@ function addParticipantMessage(sessionId, text) {
   }
   session.messages.push(msgObj);
   
-  if (session.helpCueShownAt && session.responded === null) {
-    session.responded = 1;
-    session.latencySeconds = Number(((sentAt - new Date(session.helpCueShownAt)) / 1000).toFixed(1));
-    logEvent(sessionId, "RESPONDED", { latencySeconds: session.latencySeconds, text: text });
+  if (session.cueState > 0 && session.responded[session.cueState - 1] === null) {
+    const step = session.cueState;
+    session.responded[step - 1] = 1;
+    const latency = Number(((sentAt - new Date(session.helpCueShownAt)) / 1000).toFixed(1));
+    session.latencies[step - 1] = latency;
+    session.latencySeconds = latency; // backward compatibility
     
-    // Evaluate if the user gave the correct answer (5)
-    const normalizedText = text.toLowerCase().replace(/\s/g, '');
+    logEvent(sessionId, `RESPONDED_CUE_${step}`, { latencySeconds: latency, text: text });
+    
     let botReplyText = "";
-    if (normalizedText.includes("5") || normalizedText.includes("five")) {
-      botReplyText = "Oh right, 5 minutes! Thanks so much.";
-    } else {
-      botReplyText = "Hmm, are you sure? I could have sworn they said 5 minutes.";
+    const normalizedText = text.toLowerCase().replace(/\s/g, '');
+    if (step === 1) {
+      if (normalizedText.includes("drmaya") || normalizedText.includes("maya")) {
+        botReplyText = "Oh right, Dr Maya, thanks!";
+      } else {
+        botReplyText = "Hmm, are you sure? I thought it was Dr Maya.";
+      }
+    } else if (step === 2) {
+      if (normalizedText.includes("5") || normalizedText.includes("five")) {
+        botReplyText = "Ah 5 mins, got it.";
+      } else {
+        botReplyText = "Hmm, I thought it was 5 mins.";
+      }
+    } else if (step === 3) {
+      if (normalizedText.includes("meeting123") || normalizedText.includes("123")) {
+        botReplyText = "meeting123, perfect. Thanks!";
+      } else {
+        botReplyText = "Ah, meeting123. Thanks anyway!";
+      }
     }
     
     const delay = calculateDelay(botReplyText);
     timers.push(setTimeout(() => {
-      addMessage(sessionId, { sender: "Samir", text: botReplyText, kind: "bot" });
+      const currentAsker = loadState().sessions.find(x => x.id === sessionId)?.currentAsker || "Samir";
+      addMessage(sessionId, { sender: currentAsker, text: botReplyText, kind: "bot" });
       
       timers.push(setTimeout(() => {
-        const endState = loadState();
-        const endSession = endState.sessions.find((item) => item.id === sessionId);
-        if (endSession && endSession.status !== "COMPLETED") {
-          endSession.status = "COMPLETED";
-          endSession.completedAt = new Date().toISOString();
-          saveState(endState);
-          renderDebrief(sessionId);
+        if (step < 3) {
+          triggerCue(sessionId, step + 1);
+        } else {
+          const endState = loadState();
+          const endSession = endState.sessions.find((item) => item.id === sessionId);
+          if (endSession && endSession.status !== "COMPLETED") {
+            endSession.status = "COMPLETED";
+            endSession.completedAt = new Date().toISOString();
+            saveState(endState);
+            renderDebrief(sessionId);
+          }
         }
-      }, 5000));
+      }, 3000));
     }, delay));
   } else {
     triggerDynamicBotReply(sessionId, text);
@@ -543,32 +576,74 @@ function triggerDynamicBotReply(sessionId, userText) {
   }, delay));
 }
 
-function markHelpCueShown(sessionId) {
+function triggerCue(sessionId, step) {
   const state = loadState();
   const session = state.sessions.find((item) => item.id === sessionId);
-  if (!session || session.helpCueShownAt) return;
-  session.status = "SCENARIO_TRIGGERED";
-  session.helpCueShownAt = new Date().toISOString();
-  session.timeoutDeadline = new Date(Date.now() + TIMEOUT_MS).toISOString();
+  if (!session || session.status === "COMPLETED") return;
+  
+  session.cueState = step;
+  if (step === 1) {
+    session.status = "SCENARIO_TRIGGERED";
+    session.helpCueShownAt = new Date().toISOString();
+  }
+  const timeoutLength = (step === 3) ? 120000 : 90000;
+  session.timeoutDeadline = new Date(Date.now() + timeoutLength).toISOString();
+  
+  let sender, text;
+  if (step === 1) {
+    sender = "Samir";
+    text = HELP_CUE_1;
+  } else if (step === 2) {
+    sender = session.currentAsker || "Samir";
+    text = HELP_CUE_2;
+  } else if (step === 3) {
+    sender = session.currentAsker || "Samir";
+    text = HELP_CUE_3;
+  }
+  
+  session.currentAsker = sender;
   saveState(state);
-  logEvent(sessionId, "HELP_CUE_SHOWN", { cue: HELP_CUE });
+  
+  addMessage(sessionId, { sender, text, kind: "help" });
+  logEvent(sessionId, `CUE_${step}_SHOWN`, { cue: text });
+  
   startCountdown(sessionId);
-  timers.push(setTimeout(() => completeTimeout(sessionId), TIMEOUT_MS));
-  drawMessages(sessionId);
+  timers.push(setTimeout(() => handleCueTimeout(sessionId, step), timeoutLength));
 }
 
-function completeTimeout(sessionId) {
+function handleCueTimeout(sessionId, step) {
   const state = loadState();
   const session = state.sessions.find((item) => item.id === sessionId);
-  if (!session || session.status === "COMPLETED" || !session.helpCueShownAt) return;
+  if (!session || session.status === "COMPLETED" || session.cueState !== step || session.responded[step - 1] === 1) return;
   
-  if (session.responded === null) {
-    session.responded = 0;
-    session.latencySeconds = "";
-    session.status = "COMPLETED";
-    session.completedAt = new Date().toISOString();
-    logEvent(sessionId, "TIMED_OUT", { timeoutSeconds: TIMEOUT_MS / 1000 });
-    saveState(state);
+  session.responded[step - 1] = 0;
+  saveState(state);
+  logEvent(sessionId, `TIMED_OUT_CUE_${step}`);
+  
+  if (step === 1) {
+    addMessage(sessionId, { sender: "Samir", text: "no one doesn't even know who's conducting", kind: "bot" });
+    timers.push(setTimeout(() => {
+      addMessage(sessionId, { sender: "Rohan", text: "it's conducted by Dr Maya", kind: "bot" });
+      const newState = loadState();
+      const s = newState.sessions.find(x => x.id === sessionId);
+      if (s) { s.currentAsker = "Rohan"; saveState(newState); }
+      timers.push(setTimeout(() => triggerCue(sessionId, 2), 3000));
+    }, 4000));
+  } else if (step === 2) {
+    addMessage(sessionId, { sender: "Rohan", text: "does nobody know the duration?", kind: "bot" });
+    timers.push(setTimeout(() => {
+      addMessage(sessionId, { sender: "Ishita", text: "Duration is 5 mins", kind: "bot" });
+      const newState = loadState();
+      const s = newState.sessions.find(x => x.id === sessionId);
+      if (s) { s.currentAsker = "Ishita"; saveState(newState); }
+      timers.push(setTimeout(() => triggerCue(sessionId, 3), 3000));
+    }, 4000));
+  } else if (step === 3) {
+    const newState = loadState();
+    const s = newState.sessions.find(x => x.id === sessionId);
+    s.status = "COMPLETED";
+    s.completedAt = new Date().toISOString();
+    saveState(newState);
     renderDebrief(sessionId);
   }
 }
@@ -728,8 +803,18 @@ function renderAdminDashboard() {
     `;
   }).join("");
   const sessionRows = state.sessions.map((session) => {
-    const statusClass = session.status === "COMPLETED" ? (session.responded ? "ok" : "danger") : "warn";
-    const latency = session.responded === 1 ? `${session.latencySeconds}s` : session.responded === 0 ? "Timed out" : "--";
+    const validLats = (session.latencies || []).filter(l => l !== null);
+    const avgLat = validLats.length ? (validLats.reduce((a, b) => a + b, 0) / validLats.length).toFixed(1) + "s" : "--";
+    const statusClass = session.status === "COMPLETED" ? (validLats.length > 0 ? "ok" : "danger") : "warn";
+    
+    const lat1 = session.latencies?.[0] !== null ? `${session.latencies[0]}s` : (session.responded?.[0] === 0 ? "Timeout" : "--");
+    const lat2 = session.latencies?.[1] !== null ? `${session.latencies[1]}s` : (session.responded?.[1] === 0 ? "Timeout" : "--");
+    const lat3 = session.latencies?.[2] !== null ? `${session.latencies[2]}s` : (session.responded?.[2] === 0 ? "Timeout" : "--");
+    
+    const b1 = session.responded?.[0] !== null && session.responded?.[0] !== undefined ? session.responded[0] : "--";
+    const b2 = session.responded?.[1] !== null && session.responded?.[1] !== undefined ? session.responded[1] : "--";
+    const b3 = session.responded?.[2] !== null && session.responded?.[2] !== undefined ? session.responded[2] : "--";
+    
     return `
       <tr>
         <td><strong>${escapeHtml(session.participantName)}</strong><small>${escapeHtml(session.participantEmail || "")}</small></td>
@@ -737,8 +822,13 @@ function renderAdminDashboard() {
         <td>${escapeHtml(session.groupCode)}</td>
         <td>${escapeHtml(session.condition)}</td>
         <td><span class="badge ${statusClass}">${escapeHtml(statusLabel(session))}</span></td>
-        <td>${session.responded === null ? "--" : session.responded}</td>
-        <td>${latency}</td>
+        <td>${b1}</td>
+        <td>${b2}</td>
+        <td>${b3}</td>
+        <td>${lat1}</td>
+        <td>${lat2}</td>
+        <td>${lat3}</td>
+        <td><strong>${avgLat}</strong></td>
       </tr>
     `;
   }).join("");
@@ -759,7 +849,7 @@ function renderAdminDashboard() {
       <div class="admin-main">
         <div class="admin-toolbar"><button class="primary-btn" id="exportCsv">Export CSV</button><button class="secondary-btn" id="refreshAdmin">Refresh</button><button class="danger-btn" id="clearData">Wipe All Data</button></div>
         <section class="table-card"><h2>Groups</h2><div class="table-wrap"><table><thead><tr><th>Group</th><th>Creator</th><th>Bots</th><th>Condition</th><th>Sessions</th></tr></thead><tbody id="groupTableBody">${groupRows || '<tr><td colspan="5" class="empty">No groups yet.</td></tr>'}</tbody></table></div></section>
-        <section class="table-card"><h2>Participant Sessions <small id="fbSyncStatus" style="font-weight:normal;color:var(--green-600);">(Syncing from Firebase...)</small></h2><div class="table-wrap"><table><thead><tr><th>Participant</th><th>Phone</th><th>Group</th><th>Condition</th><th>Status</th><th>Binary</th><th>Latency</th></tr></thead><tbody id="sessionTableBody">${sessionRows || '<tr><td colspan="7" class="empty">No participant data yet.</td></tr>'}</tbody></table></div></section>
+        <section class="table-card"><h2>Participant Sessions <small id="fbSyncStatus" style="font-weight:normal;color:var(--green-600);">(Syncing from Firebase...)</small></h2><div class="table-wrap"><table><thead><tr><th>Participant</th><th>Phone</th><th>Group</th><th>Condition</th><th>Status</th><th>B1</th><th>B2</th><th>B3</th><th>Lat 1</th><th>Lat 2</th><th>Lat 3</th><th>Avg</th></tr></thead><tbody id="sessionTableBody">${sessionRows || '<tr><td colspan="12" class="empty">No participant data yet.</td></tr>'}</tbody></table></div></section>
         <section class="table-card"><h2>Chat Transcripts</h2><div class="transcript-list" id="transcriptListBody">${transcriptCards || '<div class="empty">No chats have reached the admin account yet.</div>'}</div></section>
       </div>
     </section>
@@ -779,8 +869,18 @@ function renderAdminDashboard() {
           
           if (sBody) {
             const rows = allSessions.map((session) => {
-              const statusClass = session.status === "COMPLETED" ? (session.responded ? "ok" : "danger") : "warn";
-              const latency = session.responded === 1 ? `${session.latencySeconds}s` : session.responded === 0 ? "Timed out" : "--";
+              const validLats = (session.latencies || []).filter(l => l !== null);
+              const avgLat = validLats.length ? (validLats.reduce((a, b) => a + b, 0) / validLats.length).toFixed(1) + "s" : "--";
+              const statusClass = session.status === "COMPLETED" ? (validLats.length > 0 ? "ok" : "danger") : "warn";
+              
+              const lat1 = session.latencies?.[0] !== null ? `${session.latencies[0]}s` : (session.responded?.[0] === 0 ? "Timeout" : "--");
+              const lat2 = session.latencies?.[1] !== null ? `${session.latencies[1]}s` : (session.responded?.[1] === 0 ? "Timeout" : "--");
+              const lat3 = session.latencies?.[2] !== null ? `${session.latencies[2]}s` : (session.responded?.[2] === 0 ? "Timeout" : "--");
+              
+              const b1 = session.responded?.[0] !== null && session.responded?.[0] !== undefined ? session.responded[0] : "--";
+              const b2 = session.responded?.[1] !== null && session.responded?.[1] !== undefined ? session.responded[1] : "--";
+              const b3 = session.responded?.[2] !== null && session.responded?.[2] !== undefined ? session.responded[2] : "--";
+              
               return `
                 <tr>
                   <td><strong>${escapeHtml(session.participantName)}</strong><small>${escapeHtml(session.participantEmail || "")}</small></td>
@@ -788,12 +888,17 @@ function renderAdminDashboard() {
                   <td>${escapeHtml(session.groupCode)}</td>
                   <td>${escapeHtml(session.condition)}</td>
                   <td><span class="badge ${statusClass}">${escapeHtml(statusLabel(session))}</span></td>
-                  <td>${session.responded === null ? "--" : session.responded}</td>
-                  <td>${latency}</td>
+                  <td>${b1}</td>
+                  <td>${b2}</td>
+                  <td>${b3}</td>
+                  <td>${lat1}</td>
+                  <td>${lat2}</td>
+                  <td>${lat3}</td>
+                  <td><strong>${avgLat}</strong></td>
                 </tr>
               `;
             }).join("");
-            sBody.innerHTML = rows || '<tr><td colspan="7" class="empty">No participant data yet.</td></tr>';
+            sBody.innerHTML = rows || '<tr><td colspan="9" class="empty">No participant data yet.</td></tr>';
           }
           
           if (tBody) {
@@ -880,7 +985,7 @@ function transcriptMarkup(session) {
           <strong>${escapeHtml(session.participantName)}</strong>
           <small>${escapeHtml(session.groupCode)} · ${escapeHtml(session.condition)}</small>
         </div>
-        <span class="badge ${session.responded === 1 ? "ok" : session.responded === 0 ? "danger" : "warn"}">${escapeHtml(statusLabel(session))}</span>
+        <span class="badge ${session.status === "COMPLETED" ? ((session.latencies || []).some(l => l !== null) ? "ok" : "danger") : "warn"}">${escapeHtml(statusLabel(session))}</span>
       </header>
       <div class="admin-chat-log">${messages}</div>
     </article>
@@ -933,19 +1038,27 @@ function logEvent(sessionId, type, details = {}) {
 
 function exportCsv() {
   const state = loadState();
-  const header = ["participant_name", "phone", "email", "group_code", "condition", "responded_binary", "latency_seconds", "entry_time", "help_cue_shown_at", "completed_at"];
-  const rows = state.sessions.map((session) => [
-    session.participantName,
-    session.participantPhone,
-    session.participantEmail,
-    session.groupCode,
-    session.condition,
-    session.responded,
-    session.latencySeconds,
-    session.entryTime,
-    session.helpCueShownAt,
-    session.completedAt
-  ].map(csvCell));
+  const header = ["participant_name", "phone", "email", "group_code", "condition", "responded_1", "responded_2", "responded_3", "latency_1", "latency_2", "latency_3", "avg_latency", "entry_time", "completed_at"];
+  const rows = state.sessions.map((session) => {
+    const validLats = (session.latencies || []).filter(l => l !== null);
+    const avgLat = validLats.length ? (validLats.reduce((a, b) => a + b, 0) / validLats.length).toFixed(1) : "";
+    return [
+      session.participantName,
+      session.participantPhone,
+      session.participantEmail,
+      session.groupCode,
+      session.condition,
+      session.responded?.[0],
+      session.responded?.[1],
+      session.responded?.[2],
+      session.latencies?.[0],
+      session.latencies?.[1],
+      session.latencies?.[2],
+      avgLat,
+      session.entryTime,
+      session.completedAt
+    ].map(csvCell);
+  });
   const csv = [header, ...rows].map((row) => row.join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -959,8 +1072,14 @@ function exportCsv() {
 }
 
 function statusLabel(session) {
-  if (session.responded === 1) return `Responded in ${session.latencySeconds}s`;
-  if (session.responded === 0) return "Did not respond in time";
+  if (session.status === "COMPLETED") {
+    const validLats = (session.latencies || []).filter(l => l !== null);
+    if (validLats.length > 0) {
+      const avgLat = (validLats.reduce((a, b) => a + b, 0) / validLats.length).toFixed(1);
+      return `Responded (Avg ${avgLat}s)`;
+    }
+    return "Did not respond in time";
+  }
   return session.status;
 }
 
